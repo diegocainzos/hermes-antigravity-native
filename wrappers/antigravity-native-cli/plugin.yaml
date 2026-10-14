@@ -1,0 +1,5 @@
+name: antigravity-native-cli
+kind: standalone
+version: 0.1.0
+description: "`hermes antigravity-native` commands: login, doctor, models, usage"
+author: Hermes Agent

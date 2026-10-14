@@ -1,0 +1,5 @@
+name: antigravity-native
+kind: model-provider
+version: 0.1.0
+description: Google Antigravity / Cloud Code Assist via a native in-process API client (no CLI, no monkey-patching)
+author: Hermes Agent
