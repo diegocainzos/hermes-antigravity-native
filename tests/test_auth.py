@@ -21,9 +21,9 @@ def test_reuses_hermes_google_oauth_when_no_native_store(_isolated_env):
 
 def test_native_store_takes_precedence(_isolated_env):
     write(_isolated_env / "auth" / "google_oauth.json", {"refresh": "OLD"})
-    write(_isolated_env / "auth" / "antigravity_native.json", {"refresh": "NEW", "projectId": "pp"})
+    write(_isolated_env / "auth" / "antigravity_native.json", {"refresh": "NEW", "projectId": "pp", "clientId": "cid-x"})
     c = auth.load_credentials()
-    assert c.refresh == "NEW" and c.project_id == "pp" and c.source == "native"
+    assert c.refresh == "NEW" and c.project_id == "pp" and c.source == "native" and c.client_id == "cid-x"
 
 
 def test_agy_token_file_fallback(tmp_path, monkeypatch):
@@ -77,15 +77,26 @@ def test_get_valid_credentials_refreshes_and_persists_only_native(_isolated_env)
     write(gpath, {"access": "stale", "refresh": "R", "email": "e@x.com", "expires": 1})
     before = gpath.read_text()
     c = auth.get_valid_credentials(client=_token_client())
-    assert c.access == "NEWACC" and c.email == "e@x.com"
+    assert c.access == "NEWACC" and c.email == "e@x.com" and c.source == "hermes-google-oauth"
     assert gpath.read_text() == before  # foreign store untouched
-    stored = json.loads(auth.native_store_path().read_text())
-    assert stored["access"] == "NEWACC" and stored["refresh"] == "R"
-    assert oct(auth.native_store_path().stat().st_mode & 0o777) == "0o600"
-    # second call uses the fresh stored token, no network
+    assert not auth.native_store_path().exists()  # foreign tokens never land in the own store
+    cache = json.loads(auth.token_cache_path().read_text())
+    assert cache[auth.fingerprint("R")]["access"] == "NEWACC"
+    assert oct(auth.token_cache_path().stat().st_mode & 0o777) == "0o600"
+    # second call uses the cached fresh token, no network
     def boom(req):
         raise AssertionError("network used")
     assert auth.get_valid_credentials(client=httpx.Client(transport=httpx.MockTransport(boom))).access == "NEWACC"
+
+
+def test_native_refresh_persists_to_own_store(_isolated_env):
+    write(auth.native_store_path(), {"refresh": "NR", "access": "old", "expires": 1, "clientId": C.client_id(), "email": "e@x.com"})
+    c = auth.get_valid_credentials(client=_token_client())
+    stored = json.loads(auth.native_store_path().read_text())
+    assert c.source == "native" and stored["access"] == "NEWACC" and stored["refresh"] == "NR"
+    assert stored["clientId"] == C.client_id() and stored["version"] == auth.NATIVE_STORE_VERSION
+    assert oct(auth.native_store_path().stat().st_mode & 0o777) == "0o600"
+    assert not auth.token_cache_path().exists()
 
 
 def test_pkce_and_auth_url():
@@ -140,4 +151,6 @@ def test_login_with_pasted_callback(monkeypatch):
         return f"http://localhost:51121/oauth-callback?code=PASTED&state={state_holder['s']}"
     creds = auth.login(prompt=prompt, notify=notify, listen=False)
     assert seen["code"] == "PASTED" and creds.refresh == "RR"
-    assert json.loads(auth.native_store_path().read_text())["refresh"] == "RR"
+    stored = json.loads(auth.native_store_path().read_text())
+    assert stored["refresh"] == "RR" and stored["clientId"] == C.client_id()
+    assert auth.load_credentials().source == "native"

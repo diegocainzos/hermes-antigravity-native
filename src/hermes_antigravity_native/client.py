@@ -24,6 +24,18 @@ def endpoint_candidates() -> list[str]:
     return [assert_safe_api_base_url(explicit)] if explicit else list(C.ENDPOINT_FALLBACKS)
 
 
+# The legacy hermes-antigravity-auth plugin replaces ``httpx.Client.send`` process-wide
+# and rewrites every cloudcode-pa request (dropping our Authorization for its own
+# account). These are its own "already handled" markers: with them set it leaves our
+# requests untouched. No-op when that plugin is not installed.
+LEGACY_INTERCEPTOR_SKIP = ("antigravity_request_hook_processed", "antigravity_response_hook_processed")
+
+
+def native_extensions() -> dict[str, bool]:
+    """Fresh per-request httpx ``extensions`` (the legacy hook mutates them)."""
+    return {k: True for k in LEGACY_INTERCEPTOR_SKIP}
+
+
 def antigravity_headers(token: str) -> dict[str, str]:
     return {
         "Authorization": f"Bearer {token}",
@@ -105,7 +117,8 @@ class AntigravityClient:
         self.http.close()
 
     def post_json(self, endpoint: str, path: str, token: str, body: dict[str, Any], timeout: float = C.DISCOVERY_TIMEOUT_S) -> httpx.Response:
-        return self.http.post(f"{endpoint}{path}", headers=antigravity_headers(token), content=json.dumps(body), timeout=timeout)
+        return self.http.post(f"{endpoint}{path}", headers=antigravity_headers(token), content=json.dumps(body),
+                              timeout=timeout, extensions=native_extensions())
 
     def list_cloudaicompanion_projects(self, token: str) -> str | None:
         for ep in endpoint_candidates():

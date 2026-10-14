@@ -52,7 +52,7 @@ TOKEN_SKEW_S = 5 * 60
 
 DEFAULT_GATEWAY_HOST = "127.0.0.1"
 DEFAULT_GATEWAY_PORT = 51789
-LOCAL_API_KEY_PLACEHOLDER = "antigravity-native-local"
+PROVIDER_API_KEY_ENV = "ANTIGRAVITY_NATIVE_API_KEY"  # gateway bearer; see gateway.gateway_api_key()
 
 
 def env(name: str) -> str | None:
@@ -60,35 +60,49 @@ def env(name: str) -> str | None:
     return os.environ.get(f"ANTIGRAVITY_{name}") or os.environ.get(f"NOAGY_{name}") or None
 
 
-_OLD_PLUGIN_CREDS: dict[str, str] | None = None
+def hermes_home() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+
+        return Path(get_hermes_home())
+    except Exception:  # pragma: no cover - only when run outside Hermes' venv
+        return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
 
 
-def _old_plugin_client_credentials() -> dict[str, str]:
-    """Read the hermes-antigravity-auth OAuth client credentials file, if present.
+def legacy_plugin_client() -> tuple[str, str] | None:
+    """OAuth client of the old hermes-antigravity-auth plugin (``antigravity-credentials.json``).
 
-    The refresh tokens that actually work were issued to this client
-    (e.g. ``~/.hermes/antigravity-credentials.json``), so it must win over the
-    generic pi-antigravity default client id/secret.
+    Only used to refresh tokens that plugin issued. Its GCP project does not
+    have the Cloud Code API enabled, so those tokens refresh but 403 on inference.
     """
-    global _OLD_PLUGIN_CREDS
-    if _OLD_PLUGIN_CREDS is None:
-        path = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")) / "antigravity-credentials.json"
-        try:
-            data = json.loads(path.read_text())
-            _OLD_PLUGIN_CREDS = {
-                "client_id": str(data.get("client_id") or ""),
-                "client_secret": str(data.get("client_secret") or ""),
-            }
-        except (OSError, ValueError, AttributeError):
-            _OLD_PLUGIN_CREDS = {"client_id": "", "client_secret": ""}
-    return _OLD_PLUGIN_CREDS
+    try:
+        data = json.loads((hermes_home() / "antigravity-credentials.json").read_text())
+        cid, secret = str(data.get("client_id") or ""), str(data.get("client_secret") or "")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return (cid, secret) if cid and secret else None
 
 
 def client_id() -> str:
-    """Env override → hermes-antigravity-auth client file → pi-antigravity default."""
-    return env("CLIENT_ID") or _old_plugin_client_credentials().get("client_id") or _DEFAULT_CLIENT_ID
+    """Client used for new logins: env override → Google's public Antigravity client (same as agy / pi)."""
+    return env("CLIENT_ID") or _DEFAULT_CLIENT_ID
 
 
 def client_secret() -> str:
-    """Env override → hermes-antigravity-auth client file → pi-antigravity default."""
-    return env("CLIENT_SECRET") or _old_plugin_client_credentials().get("client_secret") or _DEFAULT_CLIENT_SECRET
+    return env("CLIENT_SECRET") or _DEFAULT_CLIENT_SECRET
+
+
+def known_oauth_clients() -> dict[str, str]:
+    """client_id -> client_secret for every OAuth client we can refresh tokens with."""
+    out = {_DEFAULT_CLIENT_ID: _DEFAULT_CLIENT_SECRET}
+    legacy = legacy_plugin_client()
+    if legacy:
+        out[legacy[0]] = legacy[1]
+    if env("CLIENT_ID") and env("CLIENT_SECRET"):
+        out[env("CLIENT_ID")] = env("CLIENT_SECRET")
+    return out
+
+
+def client_project_number(cid: str | None) -> str:
+    """Non-secret short label for an OAuth client id (its GCP project number)."""
+    return (cid or "").split("-", 1)[0] or "unknown"

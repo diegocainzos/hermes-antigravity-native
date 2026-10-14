@@ -70,7 +70,7 @@ def test_error_chunk_raises_redacted():
     (429, '{"error":{"message":"Individual quota reached. Resets in 2h 3m."}}', "Quota reached. Please wait 2h 3m"),
     (429, '{"error":{"message":"Resource has been exhausted (e.g. check quota)."}}', "Rate limited"),
     (429, '{"error":{"message":"Quota exceeded for x"}}', "Quota reached."),
-    (401, "x", "authentication failed"),
+    (401, "x", "rejected the access token"),
     (404, '{"error":{"message":"Requested entity was not found."}}', "not available"),
     (503, '{"error":{"message":"No capacity available for model"}}', "no capacity"),
     (400, '{"error":{"message":"Unknown name \\"foo\\""}}', "format was rejected"),

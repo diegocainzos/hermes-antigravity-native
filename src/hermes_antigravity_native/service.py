@@ -20,18 +20,15 @@ def shared_client() -> AntigravityClient:
         return _client
 
 
-def resolve_session() -> tuple[auth.Credentials, str]:
-    """Return (fresh credentials, project id); persists a newly discovered project id."""
+def resolve_session(*, force_refresh: bool = False) -> tuple[auth.Credentials, str]:
+    """Return (fresh credentials, project id); remembers a newly discovered project id."""
     client = shared_client()
-    creds = auth.get_valid_credentials()
+    creds = auth.get_valid_credentials(force_refresh=force_refresh)
     warmed = None if creds.project_id else client.load_code_assist(creds.access)
     project = resolve_project_id(credential_project_id=creds.project_id, warmed=warmed, email=creds.email)
     if creds.project_id != project and warmed:
         creds.project_id = project
-        try:
-            auth.save_credentials(creds)
-        except OSError:
-            pass
+        auth.remember(creds)  # own source only: native store or fingerprint cache
     return creds, project
 
 

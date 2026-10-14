@@ -1,13 +1,19 @@
 """OAuth + credential store (port of auth/oauth.ts).
 
-Credential resolution order (first with a usable refresh/access token wins):
+Credential sources, first usable wins (``ANTIGRAVITY_NATIVE_SOURCE`` forces one):
 
-1. ``$HERMES_HOME/auth/antigravity_native.json``  (this plugin's own store)
-2. ``$HERMES_HOME/auth/google_oauth.json``          (reused read-only: ``access``/``refresh``/``email``/``expires`` ms)
-3. ``~/.gemini/antigravity-cli/antigravity-oauth-token`` (agy CLI token file, read-only, read at runtime)
+1. ``ANTIGRAVITY_REFRESH_TOKEN`` env
+2. ``$HERMES_HOME/auth/antigravity_native.json`` — this plugin's own store, written
+   ONLY by ``hermes antigravity-native login`` (and its refreshes)
+3. ``~/.gemini/antigravity-cli/antigravity-oauth-token`` — agy CLI login (read-only)
+4. ``$HERMES_HOME/antigravity-accounts.json`` — old hermes-antigravity-auth store (read-only)
+5. ``$HERMES_HOME/auth/google_oauth.json`` — last resort (read-only)
 
-Refreshed credentials are only ever written to (1), so the other stores are
-never mutated.
+Every source remembers the OAuth client that issued its refresh token (agy and
+pi use Google's public Antigravity client), so tokens are refreshed in-process
+with the right client. Refreshed access tokens of foreign sources go to a
+fingerprint-keyed cache (``antigravity_native_cache.json``) — never into the own
+store — so a cached token can never shadow a better source.
 """
 
 from __future__ import annotations
@@ -20,7 +26,7 @@ import os
 import secrets
 import threading
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -33,22 +39,22 @@ from .security import redact_secrets
 
 logger = logging.getLogger(__name__)
 
+NATIVE_STORE_VERSION = 2
+
 
 class AuthError(RuntimeError):
     pass
 
 
-def hermes_home() -> Path:
-    try:
-        from hermes_constants import get_hermes_home
-
-        return Path(get_hermes_home())
-    except Exception:  # pragma: no cover - only when run outside Hermes' venv
-        return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+hermes_home = C.hermes_home
 
 
 def native_store_path() -> Path:
     return hermes_home() / "auth" / "antigravity_native.json"
+
+
+def token_cache_path() -> Path:
+    return hermes_home() / "auth" / "antigravity_native_cache.json"
 
 
 def hermes_google_oauth_path() -> Path:
@@ -60,7 +66,7 @@ def agy_token_path() -> Path:
 
 
 def antigravity_accounts_path() -> Path:
-    """The old hermes-antigravity-auth account store (proven-working refresh tokens)."""
+    """The old hermes-antigravity-auth account store."""
     return hermes_home() / "antigravity-accounts.json"
 
 
@@ -72,10 +78,16 @@ class Credentials:
     email: str | None = None
     project_id: str | None = None
     source: str = "native"
+    client_id: str | None = None  # OAuth client that issued ``refresh`` (None = login client)
 
     def is_fresh(self, now_ms: int | None = None) -> bool:
         now_ms = int(time.time() * 1000) if now_ms is None else now_ms
         return bool(self.access) and self.expires > now_ms
+
+    def is_usable(self, now_ms: int | None = None) -> bool:
+        """Not fresh enough to skip a refresh, but not actually expired yet either."""
+        now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+        return bool(self.access) and self.expires + C.TOKEN_SKEW_S * 1000 > now_ms
 
 
 # ── stores ────────────────────────────────────────────────────────────────
@@ -88,6 +100,16 @@ def _read_json(path: Path) -> dict[str, Any] | None:
         return None
 
 
+def _write_private_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump(payload, fh)
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+
+
 def _parse_iso_ms(value: str) -> int:
     try:
         return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000)
@@ -95,8 +117,36 @@ def _parse_iso_ms(value: str) -> int:
         return 0
 
 
+def _skewed(expires_ms: Any) -> int:
+    """Raw expiry (epoch ms) from a foreign store -> skew-adjusted ``Credentials.expires``."""
+    try:
+        raw = int(expires_ms or 0)
+    except (TypeError, ValueError):
+        return 0
+    return raw - C.TOKEN_SKEW_S * 1000 if raw else 0
+
+
+def jwt_claims(id_token: str | None) -> dict[str, Any]:
+    """Payload of an id_token, unverified (only used to label the issuing client / account)."""
+    try:
+        payload = str(id_token).split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    except (IndexError, ValueError, TypeError):
+        return {}
+    return claims if isinstance(claims, dict) else {}
+
+
+def jwt_audience(id_token: str | None) -> str | None:
+    """OAuth client that issued an id_token (``azp``/``aud``)."""
+    claims = jwt_claims(id_token)
+    aud = claims.get("azp") or claims.get("aud")
+    return aud if isinstance(aud, str) and aud else None
+
+
 def parse_native_store(d: dict[str, Any]) -> Credentials | None:
-    if not d.get("refresh"):
+    # Stores written before v2 may hold a copy of another source's token
+    # (possibly from a client whose project 403s); ignore them.
+    if not d.get("refresh") or not d.get("clientId"):
         return None
     return Credentials(
         refresh=str(d["refresh"]),
@@ -105,11 +155,12 @@ def parse_native_store(d: dict[str, Any]) -> Credentials | None:
         email=d.get("email"),
         project_id=d.get("projectId") or d.get("project_id"),
         source="native",
+        client_id=str(d["clientId"]),
     )
 
 
 def parse_hermes_antigravity_accounts(d: dict[str, Any]) -> Credentials | None:
-    """Parse the old hermes-antigravity-auth account store (the proven-working source).
+    """Parse the old hermes-antigravity-auth account store.
 
     Shape: {"activeIndex": int, "accounts": [{"email", "refreshToken",
     "projectId", "managedProjectId", "accessToken", "accessTokenExpiresAt"}]}.
@@ -121,13 +172,15 @@ def parse_hermes_antigravity_accounts(d: dict[str, Any]) -> Credentials | None:
     account = accounts[idx] if isinstance(idx, int) and 0 <= idx < len(accounts) else accounts[0]
     if not isinstance(account, dict) or not account.get("refreshToken"):
         return None
+    legacy = C.legacy_plugin_client()
     return Credentials(
         refresh=str(account["refreshToken"]),
         access=str(account.get("accessToken") or ""),
-        expires=int(account.get("accessTokenExpiresAt") or 0),
+        expires=_skewed(account.get("accessTokenExpiresAt")),
         email=account.get("email"),
         project_id=account.get("projectId") or account.get("managedProjectId") or None,
         source="hermes-antigravity-accounts",
+        client_id=legacy[0] if legacy else None,
     )
 
 
@@ -137,7 +190,7 @@ def parse_hermes_google_oauth(d: dict[str, Any]) -> Credentials | None:
     return Credentials(
         refresh=str(d["refresh"]),
         access=str(d.get("access") or ""),
-        expires=int(d.get("expires") or 0),
+        expires=_skewed(d.get("expires")),
         email=d.get("email"),
         project_id=d.get("projectId") or d.get("project_id"),
         source="hermes-google-oauth",
@@ -148,28 +201,45 @@ def parse_agy_token(d: dict[str, Any]) -> Credentials | None:
     tok = d.get("token")
     if not isinstance(tok, dict) or not tok.get("refresh_token"):
         return None
+    raw_expiry = _parse_iso_ms(str(tok.get("expiry") or ""))
+    email = jwt_claims(d.get("id_token")).get("email")
     return Credentials(
         refresh=str(tok["refresh_token"]),
         access=str(tok.get("access_token") or ""),
-        expires=_parse_iso_ms(str(tok.get("expiry") or "")),
+        expires=_skewed(raw_expiry),
+        email=email if isinstance(email, str) else None,
         source="agy-cli-token",
+        client_id=jwt_audience(d.get("id_token")),
     )
 
 
-def load_credentials() -> Credentials | None:
+# (source name, path getter, parser) in priority order.
+SOURCES: tuple[tuple[str, Callable[[], Path], Callable[[dict[str, Any]], Credentials | None]], ...] = (
+    ("native", native_store_path, parse_native_store),
+    # agy's login uses the same public client as pi, and its project has the
+    # Cloud Code API enabled — so it streams and we can refresh it in-process.
+    ("agy-cli-token", agy_token_path, parse_agy_token),
+    # Old plugin's client 1052…: refreshes fine, but inference 403s (API disabled
+    # in that client's GCP project). Only used when nothing better exists.
+    ("hermes-antigravity-accounts", antigravity_accounts_path, parse_hermes_antigravity_accounts),
+    ("hermes-google-oauth", hermes_google_oauth_path, parse_hermes_google_oauth),
+)
+SOURCE_NAMES = ("env",) + tuple(s[0] for s in SOURCES)
+
+
+def load_credentials(source: str | None = None) -> Credentials | None:
+    """First usable credentials in priority order (or only ``source`` / ``ANTIGRAVITY_NATIVE_SOURCE``)."""
+    forced = (source or C.env("NATIVE_SOURCE") or "").strip() or None
+    if forced and forced not in SOURCE_NAMES:
+        raise AuthError(f"Unknown credential source {forced!r}. Valid: {', '.join(SOURCE_NAMES)}")
     env_refresh = C.env("REFRESH_TOKEN")
-    if env_refresh:
-        return Credentials(refresh=env_refresh, email=C.env("EMAIL"), project_id=C.env("PROJECT_ID"), source="env")
-    for path, parser in (
-        (native_store_path(), parse_native_store),
-        # The agy CLI token is the ONE source verified to be authorized for
-        # Cloud Code inference (it streams today). Prefer it so Hermes works
-        # like pi: same account, no GCP console setup.
-        (agy_token_path(), parse_agy_token),
-        (antigravity_accounts_path(), parse_hermes_antigravity_accounts),
-        (hermes_google_oauth_path(), parse_hermes_google_oauth),
-    ):
-        data = _read_json(path)
+    if env_refresh and forced in (None, "env"):
+        return Credentials(refresh=env_refresh, email=C.env("EMAIL"), project_id=C.env("PROJECT_ID"),
+                           source="env", client_id=C.env("CLIENT_ID"))
+    for name, path_fn, parser in SOURCES:
+        if forced and name != forced:
+            continue
+        data = _read_json(path_fn())
         creds = parser(data) if data else None
         if creds:
             return creds
@@ -177,21 +247,56 @@ def load_credentials() -> Credentials | None:
 
 
 def save_credentials(creds: Credentials) -> None:
-    path = native_store_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
+    """Write the plugin's own store. Only for credentials from our own login."""
+    _write_private_json(native_store_path(), {
+        "version": NATIVE_STORE_VERSION,
         "refresh": creds.refresh,
         "access": creds.access,
         "expires": creds.expires,
         "email": creds.email,
         "projectId": creds.project_id,
-    }
-    tmp = path.with_suffix(".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        json.dump(payload, fh)
-    os.replace(tmp, path)
-    os.chmod(path, 0o600)
+        "clientId": creds.client_id or C.client_id(),
+    })
+
+
+# ── token cache (foreign sources) ─────────────────────────────────────────
+
+def fingerprint(refresh: str) -> str:
+    return hashlib.sha256(refresh.encode()).hexdigest()[:16]
+
+
+def _read_cache() -> dict[str, Any]:
+    return _read_json(token_cache_path()) or {}
+
+
+def apply_cache(creds: Credentials) -> Credentials:
+    """Overlay a cached access token / project id for exactly this refresh token."""
+    hit = _read_cache().get(fingerprint(creds.refresh))
+    if not isinstance(hit, dict):
+        return creds
+    out = replace(creds, project_id=creds.project_id or hit.get("projectId") or None,
+                  email=creds.email or hit.get("email") or None)
+    if int(hit.get("expires") or 0) > out.expires and hit.get("access"):
+        out.access, out.expires = str(hit["access"]), int(hit["expires"])
+    return out
+
+
+def remember(creds: Credentials) -> None:
+    """Persist refreshed access token / discovered project for ``creds``' own source only."""
+    try:
+        if creds.source == "native":
+            save_credentials(creds)
+            return
+        now = int(time.time() * 1000)
+        cache = {k: v for k, v in _read_cache().items()
+                 if isinstance(v, dict) and (int(v.get("expires") or 0) > now or v.get("projectId"))}
+        cache[fingerprint(creds.refresh)] = {
+            "source": creds.source, "access": creds.access, "expires": creds.expires,
+            "projectId": creds.project_id, "email": creds.email,
+        }
+        _write_private_json(token_cache_path(), cache)
+    except OSError as exc:
+        logger.warning("could not persist Antigravity token cache: %s", exc)
 
 
 # ── token endpoint ────────────────────────────────────────────────────────
@@ -208,16 +313,30 @@ def sanitize_oauth_error(text: str) -> str:
     return red[:300] or "unknown OAuth provider error"
 
 
+def oauth_client_for(creds: Credentials) -> tuple[str, str]:
+    """(client_id, client_secret) able to refresh ``creds``."""
+    if not creds.client_id:
+        return C.client_id(), C.client_secret()
+    secret = C.known_oauth_clients().get(creds.client_id)
+    if not secret:
+        raise AuthError(
+            f"{creds.source} token was issued by OAuth client {C.client_project_number(creds.client_id)}…, "
+            "whose secret is unknown, so it cannot be refreshed in-process."
+        )
+    return creds.client_id, secret
+
+
 def refresh_access_token(creds: Credentials, *, client: httpx.Client | None = None, now_ms: int | None = None) -> Credentials:
-    """Exchange the refresh token for a fresh access token."""
+    """Exchange the refresh token for a fresh access token (same source/client)."""
+    cid, secret = oauth_client_for(creds)
     own = client is None
     client = client or httpx.Client(timeout=20.0)
     try:
         resp = client.post(
             C.TOKEN_URL,
             data={
-                "client_id": C.client_id(),
-                "client_secret": C.client_secret(),
+                "client_id": cid,
+                "client_secret": secret,
                 "refresh_token": creds.refresh,
                 "grant_type": "refresh_token",
             },
@@ -230,48 +349,48 @@ def refresh_access_token(creds: Credentials, *, client: httpx.Client | None = No
         raise AuthError(f"Antigravity token refresh failed: {sanitize_oauth_error(resp.text)}")
     data = resp.json()
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
-    return Credentials(
+    return replace(
+        creds,
         refresh=data.get("refresh_token") or creds.refresh,
         access=data["access_token"],
         expires=now_ms + int(data.get("expires_in", 3600)) * 1000 - C.TOKEN_SKEW_S * 1000,
-        email=creds.email,
-        project_id=creds.project_id,
-        source="native",
     )
+
+
+def expired_message(creds: Credentials, cause: Exception) -> str:
+    """Actionable text for "access token expired and refresh failed"."""
+    fix = "run `hermes antigravity-native login` once (on a headless box paste the callback URL), then retry"
+    if creds.source == "agy-cli-token":
+        fix += " — or run `agy` once to re-issue its token"
+    return (f"Antigravity access token expired and could not be refreshed in-process "
+            f"(source={creds.source}: {redact_secrets(cause)}). Next: {fix}.")
 
 
 _lock = threading.Lock()
 
 
 def get_valid_credentials(*, client: httpx.Client | None = None, force_refresh: bool = False) -> Credentials:
-    """Return fresh credentials, refreshing + persisting to the native store if needed."""
+    """Return fresh credentials, refreshing in-process when needed."""
     with _lock:
         creds = load_credentials()
         if creds is None:
             raise AuthError(
-                "No Antigravity credentials found. Run `hermes antigravity-native login` "
-                "or provide ~/.hermes/auth/google_oauth.json."
+                "No Antigravity credentials found. Next: run `hermes antigravity-native login` "
+                "(or log in with the agy CLI once)."
             )
+        creds = apply_cache(creds)
         if creds.is_fresh() and not force_refresh:
             return creds
         try:
             refreshed = refresh_access_token(creds, client=client)
         except AuthError as exc:
-            # The agy CLI token and the old google_oauth store belong to private
-            # clients we cannot refresh in-process. If the stored access token is
-            # still usable, use it best-effort (it is verified to stream) instead
-            # of failing the whole call.
-            if creds.source in ("agy-cli-token", "hermes-google-oauth") and creds.access:
-                logger.warning("antigravity refresh failed (%s); using stored access token", exc)
+            if creds.is_usable() and not force_refresh:
+                logger.warning("antigravity refresh failed (%s); using stored access token until it expires", exc)
                 return creds
-            raise
+            raise AuthError(expired_message(creds, exc)) from exc
         if refreshed.email is None:
             refreshed.email = fetch_user_email(refreshed.access, client=client)
-        if C.env("REFRESH_TOKEN") is None:
-            try:
-                save_credentials(refreshed)
-            except OSError as exc:
-                logger.warning("could not persist refreshed Antigravity token: %s", exc)
+        remember(refreshed)
         return refreshed
 
 
@@ -361,6 +480,8 @@ def exchange_code(code: str, verifier: str, *, client: httpx.Client | None = Non
             refresh=data["refresh_token"],
             access=data["access_token"],
             expires=int(time.time() * 1000) + int(data.get("expires_in", 3600)) * 1000 - C.TOKEN_SKEW_S * 1000,
+            source="native",
+            client_id=C.client_id(),
         )
         creds.email = fetch_user_email(creds.access, client=client)
         return creds

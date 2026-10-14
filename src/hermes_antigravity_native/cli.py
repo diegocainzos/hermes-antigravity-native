@@ -38,7 +38,10 @@ def _status(args) -> int:
     c = auth.load_credentials()
     print(f"provider:    {C.PROVIDER_ID}\ngateway:     {gateway_base_url()}")
     print(f"credentials: {c.source + ' (' + (mask_email(c.email) or 'email unknown') + ')' if c else 'none — run `hermes antigravity-native login`'}")
+    if c:
+        print(f"oauth client: {C.client_project_number(c.client_id or C.client_id())}")
     print(f"own store:   {auth.native_store_path()} ({'present' if auth.native_store_path().exists() else 'absent'})")
+    print(f"token cache: {auth.token_cache_path()} ({'present' if auth.token_cache_path().exists() else 'absent'})")
     return 0 if c else 1
 
 

@@ -9,12 +9,16 @@ no subprocess, no external CLI, no patching of Hermes.
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
+import os
+import secrets
 import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, Iterator
 
 import httpx
@@ -51,6 +55,45 @@ def gateway_port() -> int:
 
 def gateway_base_url() -> str:
     return f"http://{C.DEFAULT_GATEWAY_HOST}:{gateway_port()}/v1"
+
+
+def gateway_key_path() -> Path:
+    return C.hermes_home() / "auth" / "antigravity_native_gateway.key"
+
+
+def gateway_api_key() -> str:
+    """Bearer the loopback gateway requires (Hermes sends it as the provider API key).
+
+    ``ANTIGRAVITY_NATIVE_API_KEY`` if set, else a random per-user key kept 0600 in
+    ``$HERMES_HOME/auth`` — so other local processes/users cannot spend this
+    account's quota through the loopback port.
+    """
+    explicit = C.env("NATIVE_API_KEY")
+    if explicit:
+        return explicit
+    path = gateway_key_path()
+    try:
+        key = path.read_text().strip()
+        if key:
+            return key
+    except OSError:
+        pass
+    key = "agn-" + secrets.token_urlsafe(24)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:  # another process won the race
+        return path.read_text().strip()
+    with os.fdopen(fd, "w") as fh:
+        fh.write(key)
+    return key
+
+
+def bearer_matches(header: str | None, expected: str) -> bool:
+    got = (header or "").strip()
+    if got[:7].lower() == "bearer ":
+        got = got[7:].strip()
+    return bool(got) and hmac.compare_digest(got.encode(), expected.encode())
 
 
 def extract_effort(body: dict[str, Any]) -> str | None:
@@ -144,7 +187,7 @@ def collect_response(chunks: Iterator[dict[str, Any]], model: str) -> dict[str, 
     return out
 
 
-def run_chat(body: dict[str, Any]) -> tuple[StreamParams, Iterator[Event]]:
+def run_chat(body: dict[str, Any], *, force_refresh: bool = False) -> tuple[StreamParams, Iterator[Event]]:
     """Resolve credentials/project and start the upstream stream (raises before any event)."""
     model = M.strip_provider_prefix(str(body.get("model") or ""))
     if not model:
@@ -152,13 +195,38 @@ def run_chat(body: dict[str, Any]) -> tuple[StreamParams, Iterator[Event]]:
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
         raise ValueError("`messages` must be a non-empty list")
-    creds, project = service.resolve_session()
+    creds, project = service.resolve_session(force_refresh=force_refresh)
     params = StreamParams(
         model_id=model, messages=messages, token=creds.access, project_id=project,
         tools=body.get("tools"), tool_choice=body.get("tool_choice"), temperature=body.get("temperature"),
         max_tokens=body.get("max_completion_tokens") or body.get("max_tokens"), effort=extract_effort(body),
     )
     return params, stream_generate(service.shared_client().http, params)
+
+
+def start_chat(body: dict[str, Any]) -> tuple[StreamParams, Iterator[Event], Event | None]:
+    """``run_chat`` + pull the first event so upstream errors surface before any bytes are sent.
+
+    An upstream 401 means the access token was revoked/expired early: refresh
+    in-process once and retry; if that still fails, raise an actionable AuthError.
+    """
+    try:
+        params, events = run_chat(body)
+        return params, events, next(events, None)
+    except AntigravityAPIError as exc:
+        if exc.status != 401:
+            raise
+        logger.info("antigravity upstream 401; forcing a token refresh and retrying once")
+    params, events = run_chat(body, force_refresh=True)
+    try:
+        return params, events, next(events, None)
+    except AntigravityAPIError as exc:
+        if exc.status != 401:
+            raise
+        raise AuthError(
+            "Antigravity rejected a freshly refreshed access token (401). Next: run "
+            "`hermes antigravity-native login`, then `hermes antigravity-native doctor`."
+        ) from exc
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -203,6 +271,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(403, openai_error(403, "forbidden host"))
         if self.path.split("?")[0].rstrip("/") != "/v1/chat/completions":
             return self._json(404, openai_error(404, "not found"))
+        if not bearer_matches(self.headers.get("Authorization"), gateway_api_key()):
+            return self._json(401, openai_error(401, "invalid antigravity-native gateway key (ANTIGRAVITY_NATIVE_API_KEY)", "invalid_api_key"))
         try:
             length = int(self.headers.get("Content-Length") or 0)
             body = json.loads(self.rfile.read(length) or b"{}")
@@ -210,9 +280,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, openai_error(400, "invalid JSON body"))
         model = str(body.get("model") or "")
         try:
-            params, events = run_chat(body)
-            # Pull the first event now so upstream HTTP errors surface as real status codes.
-            first = next(events, None)
+            params, events, first = start_chat(body)
         except AuthError as exc:
             return self._json(401, openai_error(401, str(exc), "auth_error"))
         except ValueError as exc:

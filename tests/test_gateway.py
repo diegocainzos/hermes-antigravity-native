@@ -46,7 +46,8 @@ def server(monkeypatch, _isolated_env):
     monkeypatch.setenv("ANTIGRAVITY_NATIVE_PORT", "0")
     calls = {}
 
-    def fake_session():
+    def fake_session(force_refresh=False):
+        calls.setdefault("sessions", []).append(force_refresh)
         return auth.Credentials(refresh="r", access="acc", expires=2**60), "proj"
 
     def fake_stream(http, p):
@@ -56,6 +57,8 @@ def server(monkeypatch, _isolated_env):
 
     monkeypatch.setattr(service, "resolve_session", fake_session)
     monkeypatch.setattr(G, "stream_generate", fake_stream)
+    if not calls.get("real_key_check"):
+        monkeypatch.setattr(G, "bearer_matches", lambda header, expected: True)
     calls["events"] = lambda p: ev_text("Hel", "lo")
     srv = G._Server(("127.0.0.1", 0), G.Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -109,9 +112,53 @@ def test_upstream_quota_error_maps_to_429_openai_error(server):
 
 def test_auth_error_maps_to_401(server, monkeypatch):
     base, _ = server
-    monkeypatch.setattr(service, "resolve_session", lambda: (_ for _ in ()).throw(auth.AuthError("No Antigravity credentials found.")))
+    monkeypatch.setattr(service, "resolve_session", lambda **_: (_ for _ in ()).throw(auth.AuthError("No Antigravity credentials found.")))
     r = httpx.post(base + "/v1/chat/completions", json={"model": "m", "messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 401
+
+
+def _upstream_401_then(calls, recover):
+    state = {"n": 0}
+
+    def events(p):
+        state["n"] += 1
+        if state["n"] == 1 or not recover:
+            raise S.AntigravityAPIError("Antigravity API error (401): rejected", 401)
+        yield from ev_text("ok")
+
+    calls["events"] = events
+    return state
+
+
+def test_upstream_401_forces_refresh_and_retries_once(server):
+    base, calls = server
+    state = _upstream_401_then(calls, recover=True)
+    r = httpx.post(base + "/v1/chat/completions", json={"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200 and r.json()["choices"][0]["message"]["content"] == "ok"
+    assert state["n"] == 2 and calls["sessions"] == [False, True]
+
+
+def test_persistent_401_is_actionable_auth_error(server):
+    base, calls = server
+    state = _upstream_401_then(calls, recover=False)
+    r = httpx.post(base + "/v1/chat/completions", json={"model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+    err = r.json()["error"]
+    assert r.status_code == 401 and state["n"] == 2
+    assert err["code"] == "auth_error" and "hermes antigravity-native login" in err["message"]
+
+
+def test_non_401_upstream_error_is_not_retried(server):
+    base, calls = server
+    state = {"n": 0}
+
+    def events(p):
+        state["n"] += 1
+        raise S.AntigravityAPIError("denied", 403)
+        yield  # pragma: no cover
+
+    calls["events"] = events
+    r = httpx.post(base + "/v1/chat/completions", json={"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 403 and state["n"] == 1 and calls["sessions"] == [False]
 
 
 def test_bad_requests(server):
@@ -136,3 +183,35 @@ def test_ensure_gateway_reuses_and_stops(monkeypatch):
     G.ensure_gateway_running()
     G.stop_gateway()
     assert G._server is None
+
+
+def test_gateway_key_is_generated_once_private_and_env_overrides(_isolated_env, monkeypatch):
+    k1 = G.gateway_api_key()
+    assert k1.startswith("agn-") and len(k1) > 20 and G.gateway_api_key() == k1
+    assert oct(G.gateway_key_path().stat().st_mode & 0o777) == "0o600"
+    monkeypatch.setenv("ANTIGRAVITY_NATIVE_API_KEY", "from-env")
+    assert G.gateway_api_key() == "from-env"
+
+
+def test_bearer_matches():
+    assert G.bearer_matches("Bearer abc", "abc") and G.bearer_matches("bearer  abc ", "abc") and G.bearer_matches("abc", "abc")
+    assert not G.bearer_matches("Bearer abd", "abc") and not G.bearer_matches(None, "abc") and not G.bearer_matches("Bearer ", "abc")
+
+
+def test_chat_requires_gateway_key(_isolated_env, monkeypatch):
+    monkeypatch.setenv("ANTIGRAVITY_NATIVE_API_KEY", "sekrit")
+    monkeypatch.setattr(service, "resolve_session", lambda **_: (auth.Credentials(refresh="r", access="a", expires=2**60), "p"))
+    monkeypatch.setattr(G, "stream_generate", lambda http, p: ev_text("ok"))
+    srv = G._Server(("127.0.0.1", 0), G.Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+    try:
+        assert httpx.post(base + "/v1/chat/completions", json=body).status_code == 401
+        assert httpx.post(base + "/v1/chat/completions", json=body, headers={"Authorization": "Bearer nope"}).status_code == 401
+        r = httpx.post(base + "/v1/chat/completions", json=body, headers={"Authorization": "Bearer sekrit"})
+        assert r.status_code == 200 and r.json()["choices"][0]["message"]["content"] == "ok"
+        assert httpx.get(base + "/health").status_code == 200  # probe stays open
+    finally:
+        srv.shutdown()
+        srv.server_close()

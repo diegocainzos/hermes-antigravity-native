@@ -47,7 +47,7 @@ def build_profile():
         display_name=C.PROVIDER_NAME,
         description="Google Antigravity / Cloud Code Assist — native in-process API (Gemini, Claude, GPT-OSS)",
         signup_url="https://antigravity.google",
-        env_vars=("ANTIGRAVITY_NATIVE_API_KEY",),
+        env_vars=(C.PROVIDER_API_KEY_ENV,),
         base_url=gateway_base_url(),
         auth_type="api_key",
         supports_health_check=False,
@@ -58,6 +58,15 @@ def build_profile():
 
 
 def register() -> None:
-    from providers import register_provider
+    import os
 
+    from providers import register_provider
+    from .gateway import gateway_api_key
+
+    # Hermes' api_key providers need a non-empty key; ours is the loopback gateway's
+    # bearer, so `--provider antigravity-native` works without any .env edit.
+    try:
+        os.environ.setdefault(C.PROVIDER_API_KEY_ENV, gateway_api_key())
+    except OSError as exc:
+        logger.warning("antigravity-native: could not create the gateway key: %s", exc)
     register_provider(build_profile())

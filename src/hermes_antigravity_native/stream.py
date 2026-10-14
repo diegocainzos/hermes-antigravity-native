@@ -17,7 +17,7 @@ import httpx
 
 from . import constants as C
 from . import models as M
-from .client import antigravity_headers, endpoint_candidates, json_or_text_error
+from .client import antigravity_headers, endpoint_candidates, json_or_text_error, native_extensions
 from .security import redact_secrets, safe_error
 from .transform import build_request, sanitize_tool_call_id
 
@@ -178,8 +178,14 @@ def friendly_error(status: int | None, text: str) -> str:
             return f"Antigravity rejected this request ({msg}). Next: retry once; if it keeps failing, switch models or re-login."
         return f"Bad request from Antigravity. Next: retry once, then {login} if it keeps failing. Backend said: {msg}"
     if status == 401:
-        return f"Antigravity authentication failed. Next: {login}, then retry."
+        return f"Antigravity rejected the access token (expired or revoked). Next: {login}, then retry."
     if status == 403:
+        m = re.search(r"has not been used in project (\d+)|SERVICE_DISABLED", msg, re.I)
+        if m:
+            proj = m.group(1) or "?"
+            return (f"These credentials come from an OAuth client whose GCP project ({proj}) has the Cloud Code "
+                    f"Private API disabled (typical for the old hermes-antigravity-auth login). Next: {login} "
+                    "(uses Google's public Antigravity client, like agy/pi) or set ANTIGRAVITY_NATIVE_SOURCE=agy-cli-token.")
         if re.search(r"permission|forbidden|access", msg, re.I):
             return "Antigravity access was denied for this account or project. Next: try another model, re-login, or use an account with access."
         return f"Antigravity denied this request. Next: re-login or try another model. Backend said: {msg}"
@@ -219,6 +225,28 @@ def is_hard_quota_429(text: str) -> bool:
         or re.search(r"Resets? in ", text, re.I)
         or (not re.search(r"rate.?limit", text, re.I) and re.search(r"quota exceeded|exceeded your|daily limit", text, re.I))
     )
+
+
+# Verified live 2026-10-14: the backend answers a non-quota 429 RESOURCE_EXHAUSTED to
+# any request whose system prompt contains Hermes Agent's default identity sentence,
+# while the same account/model/tools succeed without it. We only explain it.
+HERMES_IDENTITY_MARKER = "You are Hermes Agent"
+HERMES_IDENTITY_429_NOTE = (
+    "429 RESOURCE_EXHAUSTED, but this is not a quota problem (check `hermes antigravity-native usage`): "
+    "the Antigravity backend currently rejects requests whose system prompt contains Hermes Agent's "
+    "default identity line, and switching models does not help. See the README section "
+    "'Known limitation: Hermes identity is rejected upstream'."
+)
+
+
+def system_has_hermes_identity(messages: list[dict[str, Any]]) -> bool:
+    for m in messages:
+        if isinstance(m, dict) and m.get("role") in ("system", "developer"):
+            c = m.get("content")
+            text = c if isinstance(c, str) else json.dumps(c, ensure_ascii=False)
+            if HERMES_IDENTITY_MARKER in text:
+                return True
+    return False
 
 
 def _env_seconds(name: str, default_s: float) -> float:
@@ -277,7 +305,8 @@ def stream_generate(http: httpx.Client, p: StreamParams) -> Iterator[Event]:
             for ep in endpoint_candidates():
                 p.endpoint = ep
                 try:
-                    req = http.build_request("POST", f"{ep}/v1internal:streamGenerateContent?alt=sse", headers=headers, content=payload, timeout=timeout)
+                    req = http.build_request("POST", f"{ep}/v1internal:streamGenerateContent?alt=sse", headers=headers,
+                                             content=payload, timeout=timeout, extensions=native_extensions())
                     resp = http.send(req, stream=True)
                 except httpx.HTTPError as exc:
                     last_text, status, resp = safe_error(exc), None, None
@@ -300,6 +329,8 @@ def stream_generate(http: httpx.Client, p: StreamParams) -> Iterator[Event]:
             friendly = friendly_error(status, last_text)
             if status == 429 and "Quota reached." in friendly:
                 raise AntigravityAPIError(friendly, status)
+            if status == 429 and system_has_hermes_identity(p.messages):
+                friendly = HERMES_IDENTITY_429_NOTE
             raise AntigravityAPIError(
                 f"Antigravity API error ({status or 'no response'}, endpoint={p.endpoint}, project={p.project_id}, runtimeModel={runtime_model}): {friendly or last_text}",
                 status,
