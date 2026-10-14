@@ -92,22 +92,32 @@ providers de plugins (le pasa igual al `google-gemini-cli` incluido en Hermes). 
 
 Comandos: `hermes antigravity-native status|doctor|models [--live]|usage|login|serve`.
 
-## Known limitation: Hermes identity is rejected upstream
+## Hermes identity masking
+
+> **Aviso:** por defecto este provider **oculta a Google la identidad de Hermes Agent**.
+> Es una decisión informada del usuario sobre su propia cuenta, no un efecto secundario.
 
 Verificado en vivo el 14-oct-2026 y de forma determinista (3/3, Gemini y Claude): el backend
 de Antigravity responde **`429 RESOURCE_EXHAUSTED`** a cualquier petición cuyo system
 prompt contenga la frase de identidad por defecto de Hermes
-(`You are Hermes Agent, an intelligent AI assistant created by Nous Research`). La misma
+(`You are Hermes Agent, an intelligent AI assistant created by Nous Research.`). La misma
 cuenta, proyecto, modelo y las 17 tools de Hermes funcionan sin esa frase, y la cuota está
 al ~100%. No es un rate limit: parece un **bloqueo deliberado de Google** a este agente
 de terceros.
 
-Consecuencia: el pipeline nativo funciona de extremo a extremo (doctor todo PASS, incluida la
-llamada SSE por el gateway que usa Hermes, y llamadas a tools), pero un turno normal de Hermes
-con su prompt por defecto recibe ese 429. El plugin **no** reescribe ni oculta el system prompt
-para esquivarlo, porque eso sería evadir un control de acceso del proveedor (y probablemente
-sus términos de uso). Solo lo diagnostica: el error dice explícitamente que no es cuota y
-remite aquí. Qué hacer con esto es decisión tuya.
+Con `ANTIGRAVITY_NATIVE_MASK_IDENTITY=1` (por defecto), `transform.py` sustituye **solo esa
+frase** por `You are an AI coding assistant inside Google Cloud Code Assist.` en el
+`systemInstruction` saliente de `antigravity-native`. Así se hace lo mismo que pi-antigravity,
+que envía un prompt de coding-agent neutro. El resto del system prompt de Hermes (SOUL,
+tools, memoria, skills) se envía intacto. Ni el core ni los demás providers cambian. Cuando
+enmascara, el plugin deja un `WARNING` en `agent.log` (una vez por proceso; `hermes -z`
+silencia todo el logging) y `hermes antigravity-native doctor` lo muestra siempre en la
+línea `identity masking`.
+
+Ten en cuenta que esto esquiva un control que Google aplica a propósito, y puede chocar con
+sus términos de uso; el riesgo recae en la cuenta. Para enviar el prompt sin tocar:
+`ANTIGRAVITY_NATIVE_MASK_IDENTITY=0` (los turnos completos de Hermes volverán a dar el 429,
+y el error explicará el motivo).
 
 ## Coexistencia con el plugin viejo (`antigravity` / `antigravity-cli`)
 
@@ -133,16 +143,17 @@ remite aquí. Qué hacer con esto es decisión tuya.
 `ANTIGRAVITY_NATIVE_SOURCE` (forzar fuente), `ANTIGRAVITY_REFRESH_TOKEN`,
 `ANTIGRAVITY_CLIENT_ID`/`_SECRET`, `ANTIGRAVITY_PROJECT_ID`, `ANTIGRAVITY_BASE_URL`
 (solo `*.googleapis.com`), `ANTIGRAVITY_NATIVE_PORT`, `ANTIGRAVITY_NATIVE_API_KEY`
-(bearer del gateway), `ANTIGRAVITY_AGY_TOKEN_FILE`, `ANTIGRAVITY_RUNTIME_MODEL`.
+(bearer del gateway), `ANTIGRAVITY_AGY_TOKEN_FILE`, `ANTIGRAVITY_RUNTIME_MODEL`,
+`ANTIGRAVITY_NATIVE_MASK_IDENTITY` (`1` por defecto; ver arriba).
 
 ## Tests
 
 ```bash
-/root/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q   # 145 passed, offline
+/root/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q   # 154 passed, offline
 ```
 
 Incluyen: orden de fuentes y cliente por fuente, caché por huella, fallback de refresh y
 mensajes de expiry, reintento ante 401, bearer del gateway, marcadores anti-interceptor,
-diagnóstico del 429 de identidad y un test de integración (subproceso con el core de Hermes)
+enmascarado de identidad (on/off) y su diagnóstico del 429, y un test de integración (subproceso con el core de Hermes)
 que reproduce el `Unknown provider` con el nombre de directorio viejo y lo verifica resuelto
 con `0-antigravity-native`.

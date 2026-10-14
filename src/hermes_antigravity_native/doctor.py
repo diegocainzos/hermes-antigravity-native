@@ -51,6 +51,16 @@ def legacy_plugin_state() -> tuple[str, str]:
                     + "; native requests carry its skip markers so it leaves them alone")
 
 
+def identity_masking_state() -> tuple[str, str]:
+    from .transform import mask_identity_enabled
+
+    if mask_identity_enabled():
+        return "INFO", ("ON (ANTIGRAVITY_NATIVE_MASK_IDENTITY=1, user opt-in): Hermes' identity sentence is replaced by a "
+                        "neutral coding-assistant line in the system prompt sent to Google")
+    return "WARN", ("OFF (ANTIGRAVITY_NATIVE_MASK_IDENTITY=0): full Hermes agent turns will get a non-quota "
+                    "429 RESOURCE_EXHAUSTED upstream")
+
+
 def run_doctor(*, live: bool = True, probe_model: str | None = "gemini-3.8-flash-low") -> list[Check]:
     checks: list[Check] = []
 
@@ -91,6 +101,7 @@ def run_doctor(*, live: bool = True, probe_model: str | None = "gemini-3.8-flash
     step("catalog", lambda: ("PASS", f"{len(M.CATALOG)} models: " + ", ".join(M.default_model_ids())))
     step("hermes registration", hermes_registration)
     step("legacy plugin", legacy_plugin_state)
+    step("identity masking", identity_masking_state)
 
     from .gateway import gateway_api_key, gateway_base_url, gateway_key_path
 

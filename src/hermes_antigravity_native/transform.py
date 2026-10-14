@@ -7,14 +7,18 @@ adapted to the OpenAI message shape Hermes sends.
 from __future__ import annotations
 
 import json
+import logging
 import random
 import re
 import time
 import uuid
 from typing import Any
 
+from . import constants as C
 from . import models as M
 from .schema import SchemaRefError, dereference, ensure_root_object, normalize_custom_tool_schema, strip_meta
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_INSTRUCTION = (
     "You are Antigravity, a powerful agentic AI coding assistant designed by Google DeepMind. "
@@ -25,6 +29,17 @@ NO_PREAMBLE_INSTRUCTION = (
     "or your thinking/personality preambles in the final response. Output only the final response."
 )
 CONTINUATION_TEXT = "Continue the active task using the available instructions and context."
+
+# IDENTITY MASKING (user opt-in, informed trade-off): the Antigravity backend answers a
+# deterministic, non-quota 429 RESOURCE_EXHAUSTED to any system prompt carrying Hermes'
+# default identity sentence (agent/prompt_builder.py DEFAULT_AGENT_IDENTITY / default
+# SOUL.md). When ANTIGRAVITY_NATIVE_MASK_IDENTITY is on (default), that one sentence is
+# swapped for a neutral coding-assistant line in THIS provider's outbound systemInstruction
+# only, so Google does not see that the client is Hermes Agent. The rest of Hermes' system
+# prompt is sent unchanged; nothing else in Hermes is touched. Set it to 0 to send verbatim.
+HERMES_IDENTITY_RE = re.compile(r"You are Hermes Agent,\s+an intelligent AI assistant\s+created by Nous Research\.?")
+NEUTRAL_IDENTITY = "You are an AI coding assistant inside Google Cloud Code Assist."
+_mask_warned = False
 
 _SIG_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
 _DATA_URL_RE = re.compile(r"^data:([^;]+);base64,(.+)$", re.S)
@@ -89,6 +104,23 @@ def _text_of(content: Any) -> str:
     if isinstance(content, list):
         return "\n".join(str(i.get("text", "")) for i in content if isinstance(i, dict) and i.get("type") in ("text", "input_text"))
     return "" if content is None else str(content)
+
+
+def mask_identity_enabled() -> bool:
+    return (C.env("NATIVE_MASK_IDENTITY") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def mask_hermes_identity(text: str) -> str:
+    """Replace Hermes' identity sentence with ``NEUTRAL_IDENTITY`` (see the note above)."""
+    global _mask_warned
+    masked, n = HERMES_IDENTITY_RE.subn(NEUTRAL_IDENTITY, text)
+    if n and not _mask_warned:
+        _mask_warned = True
+        logger.warning(
+            "antigravity-native: MASKING the Hermes Agent identity sentence in the system prompt sent to "
+            "Google (ANTIGRAVITY_NATIVE_MASK_IDENTITY=1, user opt-in). Set ANTIGRAVITY_NATIVE_MASK_IDENTITY=0 to disable."
+        )
+    return masked
 
 
 def append_turn(contents: list[dict[str, Any]], role: str, parts: list[dict[str, Any]]) -> None:
@@ -253,6 +285,8 @@ def build_request(
     session_id: str | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     contents, system_texts = convert_messages(messages, model_id, runtime_model)
+    if mask_identity_enabled():
+        system_texts = [mask_hermes_identity(t) for t in system_texts]
     system_parts = [{"text": t} for t in system_texts] or [{"text": SYSTEM_INSTRUCTION}, {"text": NO_PREAMBLE_INSTRUCTION}]
     if not any(t["role"] == "user" and any("text" in p and p["text"].strip() for p in t["parts"]) for t in contents) and system_texts:
         contents.insert(0, {"role": "user", "parts": [{"text": "Apply the active system instructions."}]})

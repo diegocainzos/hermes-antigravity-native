@@ -64,7 +64,15 @@ def test_survives_a_legacy_style_global_send_hook(monkeypatch):
     assert status == "INFO" and "skip markers" in detail
 
 
-def test_hermes_identity_429_is_explained_not_disguised():
+def test_doctor_reports_identity_masking(monkeypatch):
+    assert doctor.identity_masking_state()[0] == "INFO" and "ON" in doctor.identity_masking_state()[1]
+    monkeypatch.setenv("ANTIGRAVITY_NATIVE_MASK_IDENTITY", "0")
+    assert doctor.identity_masking_state()[0] == "WARN"
+
+
+@pytest.mark.parametrize("mask", ["1", "0"])
+def test_hermes_identity_429_message_reflects_masking(mask, monkeypatch):
+    monkeypatch.setenv("ANTIGRAVITY_NATIVE_MASK_IDENTITY", mask)
     msgs = [{"role": "system", "content": "You are Hermes Agent, an intelligent AI assistant ..."}, {"role": "user", "content": "hi"}]
     assert S.system_has_hermes_identity(msgs)
     assert not S.system_has_hermes_identity([{"role": "user", "content": "You are Hermes Agent"}])
@@ -72,7 +80,11 @@ def test_hermes_identity_429_is_explained_not_disguised():
         lambda r: httpx.Response(429, text='{"error":{"code":429,"message":"Resource has been exhausted (e.g. check quota).","status":"RESOURCE_EXHAUSTED"}}')))
     with pytest.raises(S.AntigravityAPIError) as ei:
         list(S.stream_generate(http, S.StreamParams(model_id="gemini-3.8-flash-low", messages=msgs, token="t", project_id="p")))
-    assert ei.value.status == 429 and "not a quota problem" in str(ei.value)
+    assert ei.value.status == 429
+    if mask == "1":
+        assert "identity line was masked" in str(ei.value) and "not a quota problem" not in str(ei.value)
+    else:
+        assert "not a quota problem" in str(ei.value) and "MASK_IDENTITY=0" in str(ei.value)
 
 
 # ── provider selection (`hermes -z --provider antigravity-native`) ──────────

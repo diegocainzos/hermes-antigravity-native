@@ -165,3 +165,46 @@ def test_claude_labels_and_stable_trajectory():
     b, _ = T.build_request(model_id="claude-sonnet-4-6", runtime_model="claude-sonnet-4-6", project_id="p", messages=m)
     assert a["request"]["labels"]["trajectory_id"] == b["request"]["labels"]["trajectory_id"]
     assert a["request"]["labels"]["used_claude"] == "true" and a["request"]["labels"]["used_non_gemini_model"] == "true"
+
+
+HERMES_SYS = (
+    "You are Hermes Agent, an intelligent AI assistant created by Nous Research. "
+    "You are helpful, knowledgeable, and direct.\n\n## Tools\nUse the terminal tool wisely."
+)
+
+
+def _system_text(body):
+    return "\n".join(p["text"] for p in body["request"]["systemInstruction"]["parts"])
+
+
+def test_hermes_identity_masked_by_default():
+    msgs = [{"role": "system", "content": HERMES_SYS}, {"role": "developer", "content": "DEV"}, {"role": "user", "content": "hi"}]
+    body, _ = T.build_request(model_id="gemini-3.8-flash-low", runtime_model="gemini-3.8-flash-low", project_id="p", messages=msgs)
+    sys_text = _system_text(body)
+    assert "Hermes Agent" not in sys_text and "Nous Research" not in sys_text
+    assert sys_text.startswith(T.NEUTRAL_IDENTITY + " You are helpful, knowledgeable, and direct.")
+    assert "## Tools\nUse the terminal tool wisely." in sys_text and "DEV" in sys_text
+    assert msgs[0]["content"] == HERMES_SYS  # caller's messages are not mutated
+    assert body["request"]["contents"] == [{"role": "user", "parts": [{"text": "hi"}]}]
+
+
+def test_hermes_identity_mask_warns_loudly(caplog, monkeypatch):
+    monkeypatch.setattr(T, "_mask_warned", False)
+    with caplog.at_level("WARNING", logger="hermes_antigravity_native.transform"):
+        T.mask_hermes_identity(HERMES_SYS)
+    assert any("MASKING the Hermes Agent identity" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize("off", ["0", "false", "off", "no"])
+def test_hermes_identity_left_intact_when_toggle_off(off, monkeypatch):
+    monkeypatch.setenv("ANTIGRAVITY_NATIVE_MASK_IDENTITY", off)
+    assert not T.mask_identity_enabled()
+    body, _ = T.build_request(model_id="gemini-3.8-flash-low", runtime_model="gemini-3.8-flash-low", project_id="p",
+                              messages=[{"role": "system", "content": HERMES_SYS}, {"role": "user", "content": "hi"}])
+    assert _system_text(body) == HERMES_SYS
+
+
+def test_mask_only_touches_identity_sentence():
+    assert T.mask_hermes_identity("Talk like Hermes Agent fans do.") == "Talk like Hermes Agent fans do."
+    wrapped = "You are Hermes Agent, an intelligent AI assistant\ncreated by Nous Research. Rest."
+    assert T.mask_hermes_identity(wrapped) == T.NEUTRAL_IDENTITY + " Rest."

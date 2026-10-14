@@ -19,7 +19,7 @@ from . import constants as C
 from . import models as M
 from .client import antigravity_headers, endpoint_candidates, json_or_text_error, native_extensions
 from .security import redact_secrets, safe_error
-from .transform import build_request, sanitize_tool_call_id
+from .transform import build_request, mask_identity_enabled, sanitize_tool_call_id
 
 logger = logging.getLogger(__name__)
 
@@ -229,13 +229,18 @@ def is_hard_quota_429(text: str) -> bool:
 
 # Verified live 2026-10-14: the backend answers a non-quota 429 RESOURCE_EXHAUSTED to
 # any request whose system prompt contains Hermes Agent's default identity sentence,
-# while the same account/model/tools succeed without it. We only explain it.
+# while the same account/model/tools succeed without it. With ANTIGRAVITY_NATIVE_MASK_IDENTITY
+# on (default) transform.py masks that sentence, so the note only applies when it is off.
 HERMES_IDENTITY_MARKER = "You are Hermes Agent"
 HERMES_IDENTITY_429_NOTE = (
     "429 RESOURCE_EXHAUSTED, but this is not a quota problem (check `hermes antigravity-native usage`): "
-    "the Antigravity backend currently rejects requests whose system prompt contains Hermes Agent's "
-    "default identity line, and switching models does not help. See the README section "
-    "'Known limitation: Hermes identity is rejected upstream'."
+    "the Antigravity backend rejects requests whose system prompt contains Hermes Agent's default "
+    "identity line, and identity masking is disabled (ANTIGRAVITY_NATIVE_MASK_IDENTITY=0). Set it to 1 "
+    "to mask the identity. See the README section 'Hermes identity masking'."
+)
+HERMES_IDENTITY_MASKED_NOTE = (
+    " (The Hermes identity line was masked before sending, so this is not the known identity rejection; "
+    "check `hermes antigravity-native usage`.)"
 )
 
 
@@ -330,7 +335,7 @@ def stream_generate(http: httpx.Client, p: StreamParams) -> Iterator[Event]:
             if status == 429 and "Quota reached." in friendly:
                 raise AntigravityAPIError(friendly, status)
             if status == 429 and system_has_hermes_identity(p.messages):
-                friendly = HERMES_IDENTITY_429_NOTE
+                friendly = f"{friendly}{HERMES_IDENTITY_MASKED_NOTE}" if mask_identity_enabled() else HERMES_IDENTITY_429_NOTE
             raise AntigravityAPIError(
                 f"Antigravity API error ({status or 'no response'}, endpoint={p.endpoint}, project={p.project_id}, runtimeModel={runtime_model}): {friendly or last_text}",
                 status,
