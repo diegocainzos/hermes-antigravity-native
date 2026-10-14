@@ -162,8 +162,11 @@ def load_credentials() -> Credentials | None:
         return Credentials(refresh=env_refresh, email=C.env("EMAIL"), project_id=C.env("PROJECT_ID"), source="env")
     for path, parser in (
         (native_store_path(), parse_native_store),
-        (antigravity_accounts_path(), parse_hermes_antigravity_accounts),
+        # The agy CLI token is the ONE source verified to be authorized for
+        # Cloud Code inference (it streams today). Prefer it so Hermes works
+        # like pi: same account, no GCP console setup.
         (agy_token_path(), parse_agy_token),
+        (antigravity_accounts_path(), parse_hermes_antigravity_accounts),
         (hermes_google_oauth_path(), parse_hermes_google_oauth),
     ):
         data = _read_json(path)
@@ -251,7 +254,17 @@ def get_valid_credentials(*, client: httpx.Client | None = None, force_refresh: 
             )
         if creds.is_fresh() and not force_refresh:
             return creds
-        refreshed = refresh_access_token(creds, client=client)
+        try:
+            refreshed = refresh_access_token(creds, client=client)
+        except AuthError as exc:
+            # The agy CLI token and the old google_oauth store belong to private
+            # clients we cannot refresh in-process. If the stored access token is
+            # still usable, use it best-effort (it is verified to stream) instead
+            # of failing the whole call.
+            if creds.source in ("agy-cli-token", "hermes-google-oauth") and creds.access:
+                logger.warning("antigravity refresh failed (%s); using stored access token", exc)
+                return creds
+            raise
         if refreshed.email is None:
             refreshed.email = fetch_user_email(refreshed.access, client=client)
         if C.env("REFRESH_TOKEN") is None:
